@@ -1,0 +1,5 @@
+{
+  "name": "PDF Image Adder",
+  "description": "An application to visually add images to PDF files.",
+  "requestFramePermissions": []
+}
