@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Rnd } from 'react-rnd';
 import { PDFDocument } from 'pdf-lib';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -9,10 +9,16 @@ import { Upload, Download, ChevronLeft, ChevronRight, Image as ImageIcon, FileTe
 // Initialize PDF.js worker
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
+type OverlayImage = {
+  id: string;
+  file: File;
+  previewUrl: string;
+  pos: { x: number; y: number; width: number; height: number };
+};
+
 export default function App() {
   const [pdfFile, setPdfFile] = useState<File | null>(null);
-  const [imageFile, setImageFile] = useState<File | null>(null);
-  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
+  const [overlayImages, setOverlayImages] = useState<OverlayImage[]>([]);
   
   const [pdfDocProxy, setPdfDocProxy] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
@@ -25,13 +31,12 @@ export default function App() {
   const [renderScale, setRenderScale] = useState(1);
   const [originalDimensions, setOriginalDimensions] = useState({ width: 0, height: 0 });
   
-  const [imagePos, setImagePos] = useState({ x: 50, y: 50, width: 150, height: 150 });
   const [isExporting, setIsExporting] = useState(false);
   const [exportFormat, setExportFormat] = useState<'pdf' | 'jpg' | 'png'>('pdf');
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
 
   // Handle PDF Upload
-  const handlePdfUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+  const handlePdfUpload = (file: File) => {
     if (file && file.type === 'application/pdf') {
       setPdfFile(file);
     } else {
@@ -40,18 +45,69 @@ export default function App() {
   };
 
   // Handle Image Upload
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file && file.type.startsWith('image/')) {
-      setImageFile(file);
-      const url = URL.createObjectURL(file);
-      setImagePreviewUrl(url);
-      
-      // Reset image position when new image is uploaded
-      setImagePos({ x: 50, y: 50, width: 150, height: 150 });
+  const handleImageUpload = (files: FileList | File[]) => {
+    const newImages: OverlayImage[] = [];
+    Array.from(files).forEach((file) => {
+      if (file.type.startsWith('image/')) {
+        const url = URL.createObjectURL(file);
+        newImages.push({
+          id: Math.random().toString(36).substr(2, 9),
+          file,
+          previewUrl: url,
+          pos: { x: 50 + (newImages.length * 20), y: 50 + (newImages.length * 20), width: 150, height: 150 }
+        });
+      }
+    });
+
+    if (newImages.length > 0) {
+      setOverlayImages(prev => [...prev, ...newImages]);
     } else {
-      alert('Please select a valid image file.');
+      alert('Please select valid image files.');
     }
+  };
+
+  // Handle Drag and Drop
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+
+    const files = Array.from(e.dataTransfer.files) as File[];
+    if (files.length === 0) return;
+
+    // Check if there's a PDF in the dropped files
+    const pdfFile = files.find(f => f.type === 'application/pdf');
+    if (pdfFile) {
+      handlePdfUpload(pdfFile);
+    }
+
+    // Check for images
+    const imageFiles = files.filter(f => f.type.startsWith('image/'));
+    if (imageFiles.length > 0) {
+      handleImageUpload(imageFiles);
+    }
+  }, []);
+
+  const removeImage = (id: string) => {
+    setOverlayImages(prev => prev.filter(img => img.id !== id));
+  };
+
+  const updateImagePos = (id: string, newPos: Partial<OverlayImage['pos']>) => {
+    setOverlayImages(prev => prev.map(img => 
+      img.id === id ? { ...img, pos: { ...img.pos, ...newPos } } : img
+    ));
   };
 
   // Load PDF Document
@@ -160,7 +216,7 @@ export default function App() {
 
   // Handle Export
   const handleExport = async () => {
-    if (!pdfFile || !imageFile || !imagePreviewUrl || !canvasRef.current) return;
+    if (!pdfFile || !canvasRef.current) return;
     
     setIsExporting(true);
     try {
@@ -169,41 +225,43 @@ export default function App() {
         const pdfBytes = await pdfFile.arrayBuffer();
         const pdfDoc = await PDFDocument.load(pdfBytes);
         
-        // Load the image with pdf-lib
-        const imageBytes = await imageFile.arrayBuffer();
-        let pdfImage;
-        if (imageFile.type === 'image/png') {
-          pdfImage = await pdfDoc.embedPng(imageBytes);
-        } else if (imageFile.type === 'image/jpeg' || imageFile.type === 'image/jpg') {
-          pdfImage = await pdfDoc.embedJpg(imageBytes);
-        } else {
-          throw new Error('Unsupported image format. Please use PNG or JPEG.');
-        }
-        
         // Get the target page (0-indexed in pdf-lib)
         const pages = pdfDoc.getPages();
         const page = pages[currentPage - 1];
-        
-        // Calculate coordinates and dimensions
-        // pdf-lib's coordinate system has origin at bottom-left
-        // Our UI has origin at top-left
-        
-        // 1. Convert UI dimensions to original PDF dimensions
-        const originalWidth = imagePos.width / renderScale;
-        const originalHeight = imagePos.height / renderScale;
-        const originalX = imagePos.x / renderScale;
-        const originalY = imagePos.y / renderScale;
-        
-        // 2. Convert Y coordinate to bottom-left origin
-        const pdfY = page.getHeight() - originalY - originalHeight;
-        
-        // Draw the image
-        page.drawImage(pdfImage, {
-          x: originalX,
-          y: pdfY,
-          width: originalWidth,
-          height: originalHeight,
-        });
+
+        // Draw all images
+        for (const img of overlayImages) {
+          const imageBytes = await img.file.arrayBuffer();
+          let pdfImage;
+          if (img.file.type === 'image/png') {
+            pdfImage = await pdfDoc.embedPng(imageBytes);
+          } else if (img.file.type === 'image/jpeg' || img.file.type === 'image/jpg') {
+            pdfImage = await pdfDoc.embedJpg(imageBytes);
+          } else {
+            throw new Error('Unsupported image format. Please use PNG or JPEG.');
+          }
+          
+          // Calculate coordinates and dimensions
+          // pdf-lib's coordinate system has origin at bottom-left
+          // Our UI has origin at top-left
+          
+          // 1. Convert UI dimensions to original PDF dimensions
+          const originalWidth = img.pos.width / renderScale;
+          const originalHeight = img.pos.height / renderScale;
+          const originalX = img.pos.x / renderScale;
+          const originalY = img.pos.y / renderScale;
+          
+          // 2. Convert Y coordinate to bottom-left origin
+          const pdfY = page.getHeight() - originalY - originalHeight;
+          
+          // Draw the image
+          page.drawImage(pdfImage, {
+            x: originalX,
+            y: pdfY,
+            width: originalWidth,
+            height: originalHeight,
+          });
+        }
         
         // Save and download
         const modifiedPdfBytes = await pdfDoc.save();
@@ -224,14 +282,18 @@ export default function App() {
         const ctx = exportCanvas.getContext('2d');
         if (!ctx) throw new Error('Could not create canvas context');
 
-        // Set dimensions to match the original PDF page size
-        exportCanvas.width = originalDimensions.width;
-        exportCanvas.height = originalDimensions.height;
+        // Target 300 DPI for high-quality print (default PDF scale 1 is 72 DPI)
+        const targetDPI = 300;
+        const exportScale = targetDPI / 72;
 
         // 1. Draw the PDF page
-        // We need to re-render the page at scale 1 to get the full resolution
+        // We need to re-render the page at the target scale to get high resolution
         const page = await pdfDocProxy!.getPage(currentPage);
-        const viewport = page.getViewport({ scale: 1 });
+        const viewport = page.getViewport({ scale: exportScale });
+
+        // Set dimensions to match the scaled PDF page size
+        exportCanvas.width = viewport.width;
+        exportCanvas.height = viewport.height;
         
         const renderContext = {
           canvasContext: ctx,
@@ -240,24 +302,26 @@ export default function App() {
         
         await page.render(renderContext).promise;
 
-        // 2. Draw the overlay image
-        const img = new Image();
-        img.src = imagePreviewUrl;
-        await new Promise((resolve) => {
-          img.onload = resolve;
-        });
+        // 2. Draw all overlay images
+        for (const overlayImg of overlayImages) {
+          const img = new Image();
+          img.src = overlayImg.previewUrl;
+          await new Promise((resolve) => {
+            img.onload = resolve;
+          });
 
-        // Convert UI dimensions to original PDF dimensions
-        const originalWidth = imagePos.width / renderScale;
-        const originalHeight = imagePos.height / renderScale;
-        const originalX = imagePos.x / renderScale;
-        const originalY = imagePos.y / renderScale;
+          // Convert UI dimensions to the 300 DPI export dimensions
+          const scaledWidth = (overlayImg.pos.width / renderScale) * exportScale;
+          const scaledHeight = (overlayImg.pos.height / renderScale) * exportScale;
+          const scaledX = (overlayImg.pos.x / renderScale) * exportScale;
+          const scaledY = (overlayImg.pos.y / renderScale) * exportScale;
 
-        ctx.drawImage(img, originalX, originalY, originalWidth, originalHeight);
+          ctx.drawImage(img, scaledX, scaledY, scaledWidth, scaledHeight);
+        }
 
         // 3. Export and download
         const mimeType = exportFormat === 'jpg' ? 'image/jpeg' : 'image/png';
-        const dataUrl = exportCanvas.toDataURL(mimeType, 0.9);
+        const dataUrl = exportCanvas.toDataURL(mimeType, 1.0);
         
         const link = document.createElement('a');
         link.href = dataUrl;
@@ -277,7 +341,24 @@ export default function App() {
   };
 
   return (
-    <div className="flex h-screen bg-neutral-100 font-sans">
+    <div 
+      className={`flex h-screen font-sans transition-colors ${isDraggingOver ? 'bg-indigo-50' : 'bg-neutral-100'}`}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {isDraggingOver && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-indigo-500/20 backdrop-blur-sm pointer-events-none">
+          <div className="bg-white p-8 rounded-2xl shadow-2xl flex flex-col items-center gap-4 animate-in fade-in zoom-in duration-200">
+            <div className="w-16 h-16 bg-indigo-100 text-indigo-600 rounded-full flex items-center justify-center">
+              <Upload className="w-8 h-8" />
+            </div>
+            <h2 className="text-2xl font-bold text-indigo-900">Drop files here</h2>
+            <p className="text-indigo-600 font-medium">PDFs or Images (PNG/JPG)</p>
+          </div>
+        </div>
+      )}
+
       {/* Sidebar */}
       <div className="w-80 bg-white border-r border-neutral-200 flex flex-col shadow-sm z-10">
         <div className="p-6 border-b border-neutral-200">
@@ -296,7 +377,7 @@ export default function App() {
               <input
                 type="file"
                 accept="application/pdf"
-                onChange={handlePdfUpload}
+                onChange={(e) => e.target.files?.[0] && handlePdfUpload(e.target.files[0])}
                 className="hidden"
                 id="pdf-upload"
               />
@@ -307,7 +388,7 @@ export default function App() {
                 <div className="flex flex-col items-center gap-2 text-neutral-500 group-hover:text-indigo-600">
                   <Upload className="w-5 h-5" />
                   <span className="text-sm font-medium">
-                    {pdfFile ? pdfFile.name : 'Choose PDF file'}
+                    {pdfFile ? 'Change PDF file' : 'Choose PDF file'}
                   </span>
                 </div>
               </label>
@@ -331,12 +412,13 @@ export default function App() {
 
           {/* Step 2: Upload Image */}
           <div className="space-y-3">
-            <h2 className="text-sm font-medium text-neutral-700 uppercase tracking-wider">2. Upload Image</h2>
+            <h2 className="text-sm font-medium text-neutral-700 uppercase tracking-wider">2. Upload Images</h2>
             <div className="relative">
               <input
                 type="file"
                 accept="image/png, image/jpeg, image/jpg"
-                onChange={handleImageUpload}
+                multiple
+                onChange={(e) => e.target.files && handleImageUpload(e.target.files)}
                 className="hidden"
                 id="image-upload"
               />
@@ -347,24 +429,29 @@ export default function App() {
                 <div className="flex flex-col items-center gap-2 text-neutral-500 group-hover:text-indigo-600">
                   <ImageIcon className="w-5 h-5" />
                   <span className="text-sm font-medium">
-                    {imageFile ? imageFile.name : 'Choose Image (PNG/JPG)'}
+                    Add Images (PNG/JPG)
                   </span>
                 </div>
               </label>
             </div>
-            {imagePreviewUrl && (
-              <div className="relative group rounded-lg overflow-hidden border border-neutral-200 bg-neutral-50 p-2">
-                <img src={imagePreviewUrl} alt="Preview" className="w-full h-32 object-contain" />
-                <button 
-                  onClick={() => {
-                    setImageFile(null);
-                    setImagePreviewUrl(null);
-                  }}
-                  className="absolute top-2 right-2 p-1.5 bg-white/90 hover:bg-red-50 text-neutral-600 hover:text-red-600 rounded-md shadow-sm opacity-0 group-hover:opacity-100 transition-all"
-                  title="Remove Image"
-                >
-                  <Trash2 className="w-4 h-4" />
-                </button>
+            
+            {overlayImages.length > 0 && (
+              <div className="space-y-2">
+                {overlayImages.map((img) => (
+                  <div key={img.id} className="flex items-center justify-between bg-neutral-50 p-2 rounded-lg border border-neutral-200">
+                    <div className="flex items-center gap-3 overflow-hidden">
+                      <img src={img.previewUrl} alt="Preview" className="w-8 h-8 object-cover rounded bg-white border border-neutral-200" />
+                      <span className="text-sm text-neutral-600 truncate">{img.file.name}</span>
+                    </div>
+                    <button 
+                      onClick={() => removeImage(img.id)}
+                      className="p-1.5 hover:bg-red-50 text-neutral-500 hover:text-red-600 rounded-md transition-colors"
+                      title="Remove Image"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                ))}
               </div>
             )}
           </div>
@@ -424,7 +511,7 @@ export default function App() {
           
           <button
             onClick={handleExport}
-            disabled={!pdfFile || !imageFile || isExporting}
+            disabled={!pdfFile || isExporting}
             className="w-full flex items-center justify-center gap-2 py-3 px-4 bg-indigo-600 hover:bg-indigo-700 disabled:bg-neutral-300 disabled:text-neutral-500 text-white rounded-xl font-medium transition-colors shadow-sm disabled:shadow-none"
           >
             {isExporting ? (
@@ -441,9 +528,11 @@ export default function App() {
       <div className="flex-1 flex flex-col overflow-hidden relative" ref={containerRef}>
         {!pdfFile ? (
           <div className="flex-1 flex flex-col items-center justify-center text-neutral-400">
-            <FileText className="w-16 h-16 mb-4 opacity-20" />
-            <p className="text-lg font-medium">Upload a PDF to get started</p>
-            <p className="text-sm mt-1">You can then add and position images visually.</p>
+            <div className="w-24 h-24 mb-6 rounded-full bg-white shadow-sm flex items-center justify-center border border-neutral-200">
+              <Upload className="w-10 h-10 text-neutral-300" />
+            </div>
+            <p className="text-xl font-medium text-neutral-600">Drag and drop a PDF here</p>
+            <p className="text-sm mt-2">Or use the upload button in the sidebar</p>
           </div>
         ) : (
           <div className="flex-1 overflow-auto flex items-center justify-center p-8 bg-neutral-200/50">
@@ -456,16 +545,18 @@ export default function App() {
             >
               <canvas ref={canvasRef} className="block" />
               
-              {imagePreviewUrl && (
+              {overlayImages.map((img) => (
                 <Rnd
+                  key={img.id}
                   bounds="parent"
-                  position={{ x: imagePos.x, y: imagePos.y }}
-                  size={{ width: imagePos.width, height: imagePos.height }}
+                  position={{ x: img.pos.x, y: img.pos.y }}
+                  size={{ width: img.pos.width, height: img.pos.height }}
+                  lockAspectRatio={true}
                   onDragStop={(e, d) => {
-                    setImagePos(prev => ({ ...prev, x: d.x, y: d.y }));
+                    updateImagePos(img.id, { x: d.x, y: d.y });
                   }}
                   onResizeStop={(e, direction, ref, delta, position) => {
-                    setImagePos({
+                    updateImagePos(img.id, {
                       width: parseInt(ref.style.width, 10),
                       height: parseInt(ref.style.height, 10),
                       ...position,
@@ -475,7 +566,7 @@ export default function App() {
                 >
                   <div className="w-full h-full relative">
                     <img
-                      src={imagePreviewUrl}
+                      src={img.previewUrl}
                       alt="Overlay"
                       className="w-full h-full object-contain pointer-events-none"
                     />
@@ -487,7 +578,7 @@ export default function App() {
                     <div className="absolute -bottom-1.5 -right-1.5 w-3 h-3 bg-white border-2 border-indigo-500 rounded-full opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none" />
                   </div>
                 </Rnd>
-              )}
+              ))}
             </div>
           </div>
         )}
